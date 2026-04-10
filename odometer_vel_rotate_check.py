@@ -34,10 +34,20 @@ class Stats:
 
 
 def parse_ts(ts: str) -> dt.datetime:
+    """Parse a CLI/log timestamp string into datetime.
+
+    这个脚本既会读日志里的时间戳，也允许用户手工传入开始/结束时间。
+    统一到 datetime 后，所有时间窗判断都能复用同一套逻辑。
+    """
     return dt.datetime.strptime(ts, "%y%m%d %H%M%S.%f")
 
 
 def in_range(ts: dt.datetime, start: Optional[dt.datetime], end: Optional[dt.datetime]) -> bool:
+    """Check whether one timestamp falls inside the optional analysis window.
+
+    start/end 都允许为空，这样既能分析整份日志，也能只切一段局部窗口。
+    单独拆函数可以把边界判断集中起来，减少重复代码。
+    """
     if start and ts < start:
         return False
     if end and ts > end:
@@ -46,6 +56,13 @@ def in_range(ts: dt.datetime, start: Optional[dt.datetime], end: Optional[dt.dat
 
 
 def parse_odometer_payload(payload: str):
+    """Extract cycle and vel_rotate from the Odometer payload text.
+
+    这个专项脚本只关心两个字段：
+    - cycle 是否连续
+    - vel_rotate 是否为 0 / 缺失
+    所以这里只做最小必要解析，不尝试反序列化整条 Odometer。
+    """
     # Odometer 行格式示例:
     # [Odometer][cycle|timestamp|x|y|angle|...|vel_x|vel_y|vel_rotate]
     # 这里取首列 cycle，和末列 vel_rotate。
@@ -67,6 +84,11 @@ def parse_odometer_payload(payload: str):
 
 
 def analyze_log(log_path: Path, start: Optional[dt.datetime], end: Optional[dt.datetime]):
+    """Scan one main log and build raw statistics for later diagnosis.
+
+    这里负责产出“事实层”数据，例如 IMU/Odometer/fail 数量、cycle 跳变、
+    vel_rotate 的 0/非 0/解析失败次数。最终结论由 classify() 单独给出。
+    """
     stats = Stats()
     sec = defaultdict(lambda: {"odom": 0, "imu": 0, "fail": 0, "zero": 0, "nonzero": 0})
 
@@ -118,7 +140,12 @@ def analyze_log(log_path: Path, start: Optional[dt.datetime], end: Optional[dt.d
 
 
 def count_keyword_logs(paths, start: Optional[dt.datetime], end: Optional[dt.datetime]):
-    keywords = ("no odom", "Transform fail", "encoder timeout", "no imu")
+    """Search warning/error logs for keywords that strengthen the diagnosis.
+
+    主日志只能说明“现象”，warning/error 往往能补出 `no odom`、
+    `transform fail` 这类更直接的旁证，因此这里额外扫一遍。
+    """
+    keywords = ("no odom", "transform fail", "encoder timeout", "no imu")
     hit_count = defaultdict(int)
     hit_lines = []
 
@@ -131,10 +158,11 @@ def count_keyword_logs(paths, start: Optional[dt.datetime], end: Optional[dt.dat
         with p.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 ts_match = TS_RE.search(line)
-                if ts_match:
-                    ts = parse_ts(ts_match.group(1))
-                    if not in_range(ts, start, end):
-                        continue
+                if not ts_match:
+                    continue
+                ts = parse_ts(ts_match.group(1))
+                if not in_range(ts, start, end):
+                    continue
                 lowered = line.lower()
                 for k in keywords:
                     if k in lowered:
@@ -146,6 +174,11 @@ def count_keyword_logs(paths, start: Optional[dt.datetime], end: Optional[dt.dat
 
 
 def classify(stats: Stats, keyword_hits) -> Tuple[str, List[str]]:
+    """Convert raw counters into a readable diagnosis plus supporting reasons.
+
+    这个函数只做规则判断，不再碰日志文本。
+    好处是后续如果你想调整阈值或判断顺序，只需要改这里。
+    """
     reasons = []
     if stats.odometer_total == 0:
         reasons.append("时间窗内 Odometer 包数为 0。")
@@ -178,6 +211,11 @@ def classify(stats: Stats, keyword_hits) -> Tuple[str, List[str]]:
 
 
 def print_report(stats: Stats, sec, keyword_hits, keyword_lines, show_seconds: bool):
+    """Render the vel_rotate diagnosis in a field-friendly report format.
+
+    报告顺序按“统计值 -> 判断规则 -> 结论 -> 样例”展开，
+    方便现场先看结论，再根据需要继续追溯证据。
+    """
     # 告诉使用者脚本正在验证什么。
     print("=== vel_rotate 缺失原因验证报告 ===")
     print("【正在做什么】")
@@ -246,6 +284,11 @@ def print_report(stats: Stats, sec, keyword_hits, keyword_lines, show_seconds: b
 
 
 def main():
+    """Provide a CLI entry for the vel_rotate specialized check.
+
+    main() 只负责参数解析、文件存在性检查，以及把统计和打印串起来，
+    让脚本在终端里保持直接可用。
+    """
     parser = argparse.ArgumentParser(
         description="验证 vel_rotate 缺失是 0 省略还是上游 Odometer 异常"
     )

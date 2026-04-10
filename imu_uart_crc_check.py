@@ -82,7 +82,7 @@ def crc32_fw(buf, crc=1):
     return crc & 0xFFFFFFFF
 
 
-def analyze_file(path: Path, frame_size=68):
+def analyze_file(path: Path, frame_size=68, timestamp_offset=56, header=b"\xA5\x5A\x01\x3C"):
     """
     Scan full binary file, validate candidate frames, and extract metadata.
 
@@ -91,6 +91,11 @@ def analyze_file(path: Path, frame_size=68):
     - bad: number of header hits whose CRC failed
     - ts: extracted trans_timestamp list from valid frames
     - offsets: file offsets of valid frames
+
+    Parameters:
+    - frame_size: total bytes per frame
+    - timestamp_offset: byte offset of trans_timestamp inside one frame
+    - header: exact frame header bytes to match before doing CRC validation
 
     中文语法解释：
     - 类型标注 `path: Path` 只是“提示”，不会在运行时强制类型检查。
@@ -108,6 +113,18 @@ def analyze_file(path: Path, frame_size=68):
     """
     # Path.read_bytes() loads entire file as one bytes object.
     data = path.read_bytes()
+    if not header:
+        raise ValueError("header must not be empty")
+    if len(header) > frame_size - 4:
+        raise ValueError(
+            f"invalid header length={len(header)} for frame_size={frame_size}: "
+            "header must fit before payload/CRC"
+        )
+    if timestamp_offset < 0 or timestamp_offset + 4 > frame_size - 4:
+        raise ValueError(
+            f"invalid timestamp_offset={timestamp_offset} for frame_size={frame_size}: "
+            "timestamp must fit before the trailing CRC"
+        )
     ok = 0
     bad = 0
     ts = []
@@ -118,7 +135,7 @@ def analyze_file(path: Path, frame_size=68):
     # then validate full frame.
     i = 0
     while i + frame_size <= len(data):
-        if data[i] == 0xA5 and data[i + 1] == 0x5A and data[i + 2] == 0x01 and data[i + 3] == 0x3C:
+        if data[i:i + len(header)] == header:
             # bytes slicing: [start:end], end excluded.
             # 中文：frm 长度是 frame_size；等价于“从 i 开始取 frame_size 个字节”。
             frm = data[i:i + frame_size]
@@ -135,9 +152,10 @@ def analyze_file(path: Path, frame_size=68):
             if c_calc == c_recv:
                 ok += 1
                 # trans_timestamp offset:
-                # 2(head)+1(type)+1(len)+52(data before timestamp) = 56
+                # default SRC2500 layout uses offset 56, but caller may override it
+                # for compatible fixed-length protocol variants.
                 # 中文：仍然是 `<I`，因为 timestamp 在协议里也是 uint32 小端。
-                ts.append(struct.unpack_from("<I", frm, 56)[0])
+                ts.append(struct.unpack_from("<I", frm, timestamp_offset)[0])
                 offsets.append(i)
                 # Fast-path step: valid fixed-length frame found.
                 # 中文：既然这一帧合法，下一帧候选点直接跳到 i+frame_size。
@@ -151,6 +169,13 @@ def analyze_file(path: Path, frame_size=68):
 
 
 def main():
+    """Provide a small CLI for offline IMU UART frame verification.
+
+    这个入口只做两件事：
+    1. 接收抓包文件和帧长参数
+    2. 调用 analyze_file() 并把关键统计打印出来
+    协议细节已经都收在前面的辅助函数里。
+    """
     # argparse creates a CLI parser and auto-generates --help text.
     parser = argparse.ArgumentParser(description="Check IMU UART frames by CRC32 and timestamp continuity.")
     parser.add_argument(
@@ -164,6 +189,17 @@ def main():
         type=int,
         default=68,
         help="Frame size in bytes (default: 68)",
+    )
+    parser.add_argument(
+        "--timestamp-offset",
+        type=int,
+        default=56,
+        help="trans_timestamp byte offset inside one frame (default: 56)",
+    )
+    parser.add_argument(
+        "--header",
+        default="a55a013c",
+        help="Exact header hex bytes for frame sync/check (default: a55a013c)",
     )
 
     # parse_args() converts command-line options to attributes:
@@ -179,7 +215,9 @@ def main():
         # Raise readable CLI error and exit non-zero.
         raise SystemExit(f"input file not found: {path}")
 
-    ok, bad, ts, offsets = analyze_file(path, args.frame_size)
+    ok, bad, ts, offsets = analyze_file(
+        path, args.frame_size, args.timestamp_offset, bytes.fromhex(args.header)
+    )
     print(f"file={path}")
     print(f"valid_frames={ok}, crc_fail_hits={bad}")
 

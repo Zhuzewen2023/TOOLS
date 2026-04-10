@@ -54,6 +54,11 @@ def run_cmd(cmd):
 
 
 def stty_show(device):
+    """Print the current tty configuration for one UART device.
+
+    这个函数对应最基础的“先看现场状态”，适合在修改串口参数前先确认
+    当前设备到底是什么配置，避免盲目覆盖。
+    """
     # Equivalent to: stty -F /dev/ttyS5 -a
     # 中文：device 是字符串路径，例如 "/dev/ttyS5"。
     # 接口说明（stty）：
@@ -64,6 +69,11 @@ def stty_show(device):
 
 
 def stty_setup(device, baud, hw_flow):
+    """Apply the expected IMU UART serial settings to one device.
+
+    它把 IMU 常用的 8N1、raw、关闭软件流控等基线参数收口到一处，
+    让 `setup` 和 `all` 子命令都复用同一套串口配置逻辑。
+    """
     # Common IMU binary protocol baseline: 8N1 + raw + no software flow.
     cmd = [
         "stty",
@@ -93,10 +103,14 @@ def stty_setup(device, baud, hw_flow):
 
 
 def capture_seconds(device, output, seconds, bs):
+    """Capture UART bytes for a fixed duration.
+
+    这个路径适合“先抓一小段看看有没有数据”，所以用 `timeout + dd`
+    控制持续时间，而不是事先知道要读多少字节。
+    """
     # timeout protects against endless read when UART keeps streaming.
     # 中文：f"{seconds}s" 是 f-string，运行时把变量 seconds 插入字符串。
-    run_cmd(
-        [
+    cmd= [
             "timeout",
             f"{seconds}s",
             "dd",
@@ -105,15 +119,30 @@ def capture_seconds(device, output, seconds, bs):
             f"bs={bs}",
             "status=none",
         ]
-    )
+    
+    
+    res = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    if res.returncode not in (0,124):
+        raise subprocess.CalledProcessError(
+            res.returncode, cmd, output=res.stdout, stderr=res.stderr
+        )
+        
+    out_path = Path(output)
+    if not out_path.exists():
+        raise FileNotFoundError(output)
     # 接口说明（timeout + dd）：
     # - timeout Ns <cmd>: 最多运行N秒，超时会终止子进程
     # - dd if=<in> of=<out> bs=<size>: 从输入设备拷贝原始字节到文件
     # - status=none: 不打印dd统计信息
-    print(f"captured {seconds}s to {output}")
+    print(f"captured {out_path.stat().st_size} bytes to {output}")
 
 
 def capture_bytes(device, output, bs, count):
+    """Capture a fixed amount of UART data measured in dd blocks.
+
+    当你已经知道大概要抓多少数据时，用按块数读取更可控。
+    这一条路径不会依赖 timeout，而是读满 `count * bs` 后自然结束。
+    """
     # Size-based capture: total bytes = bs * count
     # 中文：这里不加 timeout，dd 在读满 count 个块后自然退出。
     run_cmd(
@@ -126,9 +155,12 @@ def capture_bytes(device, output, bs, count):
             "status=none",
         ]
     )
+    out_path = Path(output)
+    if not out_path.exists():
+        raise FileNotFoundError(output)
     # 接口说明（dd count）：
-    # 读取块数为 count，每块 bs 字节，总字节约等于 bs*count。
-    print(f"captured {bs * count} bytes to {output}")
+    # 对串口设备通常会接近 bs*count，但最终还是以输出文件实际大小为准。
+    print(f"captured {out_path.stat().st_size} bytes to {output}")
 
 
 def find_offsets(data, pattern, limit):
@@ -185,13 +217,20 @@ def hex_dump_slice(data, start, count):
         print(f"{row:08x}: {hx:<47}  {ascii_s}")
 
 
-def check_file(path, frame_size):
+def check_file(path, frame_size, timestamp_offset, header_hex):
+    """Run the shared CRC/timestamp verifier on one capture file.
+
+    `imu_uart_tool.py` 自己不重复实现协议解析细节，而是把这部分交给
+    `imu_uart_crc_check.py`。这样抓包工作流和协议校验逻辑可以解耦维护。
+    """
     # Delegate protocol parsing/CRC checks to shared verifier module.
     # 中文：这里把“协议细节”集中在 imu_uart_crc_check.py，避免重复代码。
     # 接口说明：
     # - path: Path 对象，指向抓包bin文件
     # - frame_size: 协议帧总长度（默认68）
-    ok, bad, ts, offsets = analyze_file(path, frame_size)
+    # - timestamp_offset: trans_timestamp 在帧内的字节偏移（默认56）
+    # - header_hex: 帧头十六进制文本；需要与 find/all 里的 pattern 保持一致
+    ok, bad, ts, offsets = analyze_file(path, frame_size, timestamp_offset, bytes.fromhex(header_hex))
     print(f"file={path}")
     print(f"valid_frames={ok}, crc_fail_hits={bad}")
     if ok > 1:
@@ -206,6 +245,11 @@ def check_file(path, frame_size):
 
 
 def main():
+    """Build the subcommand CLI and dispatch the UART workflow steps.
+
+    main() 负责把 `show/setup/capture/find/dump/check/all` 这些动作串起来，
+    让同一份脚本既能单步执行，也能一键跑完整工作流。
+    """
     # Top-level CLI parser.
     # 中文：description 会出现在 `-h` 的帮助标题里。
     parser = argparse.ArgumentParser(description="Reusable IMU UART capture/probe/check tool.")
@@ -236,7 +280,7 @@ def main():
     capture_p.add_argument("--bs", type=int, default=4096)
 
     find_p = sub.add_parser("find", parents=[common], help="Find frame headers")
-    find_p.add_argument("--pattern", default="a55a01", help="Hex bytes, no spaces")
+    find_p.add_argument("--pattern", default="a55a013c", help="Hex bytes, no spaces")
     find_p.add_argument("--limit", type=int, default=10)
 
     dump_p = sub.add_parser("dump", parents=[common], help="Dump bytes around offsets")
@@ -246,14 +290,18 @@ def main():
 
     check_p = sub.add_parser("check", parents=[common], help="CRC/timestamp check")
     check_p.add_argument("--frame-size", type=int, default=68)
+    check_p.add_argument("--timestamp-offset", type=int, default=56)
+    check_p.add_argument("--header", default="a55a013c", help="Header hex bytes for check, default a55a013c")
 
     all_p = sub.add_parser("all", parents=[common], help="Setup + capture + find + check")
     all_p.add_argument("--baud", type=int, default=115200)
     all_p.add_argument("--seconds", type=int, default=3)
     all_p.add_argument("--bs", type=int, default=4096)
-    all_p.add_argument("--pattern", default="a55a01")
+    all_p.add_argument("--pattern", default="a55a013c")
     all_p.add_argument("--limit", type=int, default=10)
     all_p.add_argument("--frame-size", type=int, default=68)
+    all_p.add_argument("--timestamp-offset", type=int, default=56)
+    all_p.add_argument("--header", help="Header hex for check; defaults to --pattern")
     all_p.add_argument("--hw-flow", action="store_true", help="Enable RTS/CTS")
 
     # argparse converts options to attributes:
@@ -309,7 +357,7 @@ def main():
 
     if args.cmd == "check":
         # 接口说明：复用统一校验入口。
-        check_file(Path(args.output), args.frame_size)
+        check_file(Path(args.output), args.frame_size, args.timestamp_offset, args.header)
         return
 
     if args.cmd == "all":
@@ -320,7 +368,12 @@ def main():
         pattern = bytes.fromhex(args.pattern)
         offsets = find_offsets(data, pattern, args.limit)
         print("header_offsets=", ",".join(str(x) for x in offsets))
-        check_file(Path(args.output), args.frame_size)
+        check_file(
+            Path(args.output),
+            args.frame_size,
+            args.timestamp_offset,
+            args.header or args.pattern,
+        )
         return
 
 

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  pftgrep [OPTIONS] PATTERN [PATH...]
+  pftgrep [OPTIONS] --imu [PATH...]
+  pftgrep [OPTIONS] --imu-error [PATH...]
+  pftgrep [OPTIONS] --imu-route [PATH...]
+  pftgrep --summary [PATH...]
+
+Description:
+  Grep over normal text logs and `.pft.zst` / `.zst` trace files.
+  For compressed trace files, the default pipeline is:
+    zstdcat FILE | strings -n 8 | grep ...
+
+Options:
+  -a                         Accepted for grep compatibility. No-op here.
+  -i, --ignore-case         Ignore case.
+  -E, --extended-regexp     Use extended regexp. Default.
+  -F, --fixed-string        Use fixed-string matching.
+  -n, --line-number         Show line numbers from the extracted text stream.
+  -c, --count               Show per-file match count.
+  -l, --files-with-matches  Show only file names with matches.
+  -r, -R                    Recurse into directories.
+  --raw                     Skip `strings`, grep decompressed output directly.
+  --no-filter               Do not hide protobuf/schema noise for `.zst` files.
+  --min-len N               Minimum length for `strings`. Default: 8.
+  --imu                     Preset: IMU routes + common IMU errors.
+  --imu-error               Preset: only IMU error phrases.
+  --imu-route               Preset: only IMU route lines.
+  --summary                 Without PATTERN: print IMU route/error summary.
+                            With PATTERN/preset: print per-file match count.
+  -h, --help                Show this help.
+
+Examples:
+  pftgrep -ar "IMU" /opt/.data/diagnosis/rbk/trace/event
+  pftgrep -air "imu" /opt/.data/diagnosis/rbk/trace/event
+  pftgrep -ar "ImuTimingMetrics" .
+  pftgrep --imu /opt/.data/diagnosis/rbk/trace/event
+  pftgrep --no-filter -ar "Imu" /opt/.data/diagnosis/rbk/trace/event
+  pftgrep --imu-route -c /opt/.data/diagnosis/rbk/trace/event
+EOF
+}
+
+die() {
+  echo "pftgrep: $*" >&2
+  exit 1
+}
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+decompress_file() {
+  local file="$1"
+  case "$file" in
+    *.zst) zstdcat -- "$file" ;;
+    *) cat -- "$file" ;;
+  esac
+}
+
+filter_pft_noise() {
+  LC_ALL=C grep -aEv \
+    '^(msg[A-Za-z0-9_]+|\.?rbk\.protocol\.msg[A-Za-z0-9_]+[A-Za-z]?|message_[A-Za-z0-9_]+\.proto|isIMUCalibrating|IMUDebugPrintFrameRate)$' \
+    | awk 'length($0) <= 400'
+}
+
+text_stream() {
+  local file="$1"
+  if (( raw_mode )); then
+    decompress_file "$file"
+  elif [[ "$file" == *.zst ]]; then
+    # Perfetto trace payloads are binary; `strings` turns them into grep-able text.
+    if (( noise_filter )); then
+      decompress_file "$file" | LC_ALL=C strings -n "$min_len" | filter_pft_noise
+    else
+      decompress_file "$file" | LC_ALL=C strings -n "$min_len"
+    fi
+  else
+    cat -- "$file"
+  fi
+}
+
+append_path_arg() {
+  local arg="$1"
+
+  if [[ -d "$arg" ]]; then
+    if (( recursive )); then
+      while IFS= read -r -d '' item; do
+        files+=("$item")
+      done < <(find "$arg" -type f -print0)
+    else
+      while IFS= read -r -d '' item; do
+        files+=("$item")
+      done < <(find "$arg" -maxdepth 1 -type f -print0)
+    fi
+    return
+  fi
+
+  files+=("$arg")
+}
+
+ignore_case=0
+grep_mode="-E"
+show_line=0
+count_only=0
+list_only=0
+raw_mode=0
+summary_mode=0
+recursive=0
+noise_filter=1
+min_len=8
+pattern=""
+declare -a files=()
+declare -a normalized_args=()
+
+while (($#)); do
+  case "$1" in
+    --ignore-case) normalized_args+=("-i") ;;
+    --extended-regexp) normalized_args+=("-E") ;;
+    --fixed-string) normalized_args+=("-F") ;;
+    --line-number) normalized_args+=("-n") ;;
+    --count) normalized_args+=("-c") ;;
+    --files-with-matches) normalized_args+=("-l") ;;
+    --help) normalized_args+=("-h") ;;
+    --raw|--summary|--imu|--imu-error|--imu-route|--no-filter)
+      normalized_args+=("$1")
+      ;;
+    --min-len)
+      normalized_args+=("$1")
+      shift
+      [[ $# -gt 0 ]] || die "--min-len requires a value"
+      normalized_args+=("$1")
+      ;;
+    --)
+      normalized_args+=("--")
+      shift
+      while (($#)); do
+        normalized_args+=("$1")
+        shift
+      done
+      break
+      ;;
+    *)
+      normalized_args+=("$1")
+      ;;
+  esac
+  shift
+done
+
+set -- "${normalized_args[@]}"
+
+while (($#)); do
+  case "$1" in
+    --raw)
+      raw_mode=1
+      shift
+      ;;
+    --summary)
+      summary_mode=1
+      shift
+      ;;
+    --no-filter)
+      noise_filter=0
+      shift
+      ;;
+    --imu)
+      pattern='no imu|imu data not update|Check the imu|rbk\.protocol\.msgIMU'
+      shift
+      ;;
+    --imu-error)
+      pattern='no imu|imu data not update|Check the imu|IMU not calibrated'
+      shift
+      ;;
+    --imu-route)
+      pattern='rbk\.protocol\.msgIMU[[:space:]]+--->'
+      shift
+      ;;
+    --min-len)
+      shift
+      [[ $# -gt 0 ]] || die "--min-len requires a value"
+      [[ "$1" =~ ^[0-9]+$ ]] || die "--min-len must be a non-negative integer"
+      min_len="$1"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      short_opts="${1#-}"
+      while [[ -n "$short_opts" ]]; do
+        opt="${short_opts:0:1}"
+        short_opts="${short_opts:1}"
+        case "$opt" in
+          a) ;;
+          E) grep_mode="-E" ;;
+          F) grep_mode="-F" ;;
+          i) ignore_case=1 ;;
+          R|r) recursive=1 ;;
+          n) show_line=1 ;;
+          l) list_only=1 ;;
+          c) count_only=1 ;;
+          h)
+            usage
+            exit 0
+            ;;
+          *)
+            die "unknown option: -$opt"
+            ;;
+        esac
+      done
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+while (($#)); do
+  if [[ -z "$pattern" && $summary_mode -eq 0 ]]; then
+    pattern="$1"
+  else
+    append_path_arg "$1"
+  fi
+  shift
+done
+
+if (( count_only && list_only )); then
+  die "--count and --files-with-matches cannot be used together"
+fi
+
+if (( summary_mode == 0 )) && [[ -z "$pattern" ]]; then
+  die "missing PATTERN or preset option"
+fi
+
+if (( ${#files[@]} == 0 )); then
+  append_path_arg "."
+fi
+
+require_tool grep
+require_tool zstdcat
+if (( raw_mode == 0 )); then
+  require_tool strings
+fi
+
+declare -a grep_args=("$grep_mode" "-a")
+((ignore_case)) && grep_args+=("-i")
+((show_line)) && grep_args+=("-n")
+
+count_file() {
+  local file="$1"
+  local output=""
+  output="$(text_stream "$file" | LC_ALL=C grep "${grep_args[@]}" -c -- "$pattern" || true)"
+  printf '%s' "$output"
+}
+
+if (( summary_mode )); then
+  if [[ -n "$pattern" ]]; then
+    for file in "${files[@]}"; do
+      [[ -f "$file" ]] || {
+        echo "pftgrep: skip missing file: $file" >&2
+        continue
+      }
+      printf '%s | matches:%s\n' "$file" "$(count_file "$file")"
+    done
+    exit 0
+  fi
+
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || {
+      echo "pftgrep: skip missing file: $file" >&2
+      continue
+    }
+    route_count="$(
+      text_stream "$file" | LC_ALL=C grep -a -cE -- 'rbk\.protocol\.msgIMU[[:space:]]+--->' || true
+    )"
+    error_count="$(
+      text_stream "$file" | LC_ALL=C grep -a -ciE 'no imu|imu data not update|IMU not calibrated|Check the imu' || true
+    )"
+    printf '%s | route:%s | err:%s\n' "$file" "$route_count" "$error_count"
+  done
+  exit 0
+fi
+
+for file in "${files[@]}"; do
+  [[ -f "$file" ]] || {
+    echo "pftgrep: skip missing file: $file" >&2
+    continue
+  }
+
+  if (( list_only )); then
+    if text_stream "$file" | LC_ALL=C grep "${grep_args[@]}" -q -- "$pattern"; then
+      printf '%s\n' "$file"
+    fi
+    continue
+  fi
+
+  if (( count_only )); then
+    printf '%s:%s\n' "$file" "$(count_file "$file")"
+    continue
+  fi
+
+  while IFS= read -r line; do
+    printf '%s:%s\n' "$file" "$line"
+  done < <(text_stream "$file" | LC_ALL=C grep "${grep_args[@]}" -- "$pattern" || true)
+done
